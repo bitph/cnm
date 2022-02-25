@@ -5,8 +5,9 @@ import time
 
 import numpy as np
 import torch
+from torch.utils import data
 
-from models.loss import weakly_supervised_loss, cal_nll_loss, margin_ranking_loss
+from models.loss import ivc_loss, rec_loss
 from utils import TimeMeter, AverageMeter
 
 import pickle
@@ -36,8 +37,9 @@ class MainRunner:
         self.args = args
         self._build_dataset()
 
-        self.args['model']['config']['prop_width'] = self.args['dataset']['prop_width']
-        self.args['model']['config']['target_stride'] = self.args['dataset']['target_stride']
+        self.args['model']['config']['max_num_words'] = self.args['dataset']['max_num_words']
+        self.args['model']['config']['frames_input_size'] = self.args['dataset']['frame_dim']
+        self.args['model']['config']['words_input_size'] = self.args['dataset']['word_dim']
         self.args['model']['config']['vocab_size'] = self.train_set.vocab_size
 
         self._build_model()
@@ -46,7 +48,8 @@ class MainRunner:
             self.num_updates = 0
 
     def train(self):
-        for epoch in range(1, self.args['train']['max_num_epochs']+1):
+        best_results = None
+        for epoch in range(self.args['train']['max_num_epochs']):
             info('Start Epoch {}'.format(epoch))
             self.model_saved_path = self.args['train']['model_saved_path']
             os.makedirs(self.model_saved_path, mode=0o755, exist_ok=True)
@@ -54,9 +57,17 @@ class MainRunner:
 
             self._train_one_epoch(epoch)
             self._save_model(save_path)
-            self.eval()
-            # self.eval(bias=bias, top_n=5, thresh=0.45)
+            results = self.eval()
+            if best_results is None or results['mIoU'].avg > best_results['mIoU'].avg:
+                best_results = results
+                os.system('cp %s %s'%(save_path, os.path.join(self.model_saved_path, 'model-best.pt')))
+                info('Best results have been updated.')
             info('=' * 60)
+        
+        msg = '|'.join([' {} {:.4f} '.format(k, v.avg) for k, v in best_results.items()])
+        info('Best results:')
+        info('|'+msg+'|')
+
 
     def _train_one_epoch(self, epoch, **kwargs):
         self.model.train()
@@ -74,42 +85,27 @@ class MainRunner:
         loss_meter = collections.defaultdict(lambda: AverageMeter())
 
         for bid, batch in enumerate(self.train_loader, 1):
-            # pdb.set_trace()
-            self.model.unfrozen()
-            self.optimizer.zero_grad()
+            self.model.froze_mask_generator()
+            self.rec_optimizer.zero_grad()
             net_input = move_to_cuda(batch['net_input'])
             output = self.model(**net_input)
-            loss, loss_dict = weakly_supervised_loss(**output, num_props=self.model.num_props, **self.args['loss'])
-            # neg_loss, neg_loss_dict = margin_ranking_loss(**output, num_props=self.model.num_props, **self.args['loss'])
-            # loss = loss + neg_loss
-            # loss_dict.update(neg_loss_dict)
-            # backward
+            loss, loss_dict = rec_loss(**output, **self.args['loss'])
             loss.backward(retain_graph=True)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10)
-            # update
-            self.optimizer.step()
+            self.rec_optimizer.step()
 
-            if self.args['model']['twostep']:
-                self.model.frozen()
-                self.gauss_optimizer.zero_grad()
-                output = self.model(**net_input)
-                loss, neg_loss_dict = margin_ranking_loss(**output, num_props=self.model.num_props, **self.args['loss'])
-                loss_dict.update(neg_loss_dict)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10)
-                self.gauss_optimizer.step()
-            else:
-                self.model.frozen()
-                self.gauss_optimizer.zero_grad()
-                loss, neg_loss_dict = margin_ranking_loss(**output, num_props=self.model.num_props, **self.args['loss'])
-                loss_dict.update(neg_loss_dict)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10)
-                self.gauss_optimizer.step()
+            self.model.froze_reconstructor()
+            self.mask_optimizer.zero_grad()
+            output = self.model(**net_input)
+            loss, ivc_loss_dict = ivc_loss(**output, **self.args['loss'])
+            loss_dict.update(ivc_loss_dict)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10)
+            self.mask_optimizer.step()
 
             self.num_updates += 1
-            curr_lr = self.lr_scheduler.step_update(self.num_updates)
-            self.gauss_lr_scheduler.step_update(self.num_updates)
+            curr_lr = self.rec_lr_scheduler.step_update(self.num_updates)
+            self.mask_lr_scheduler.step_update(self.num_updates)
             time_meter.update()
             for k, v in loss_dict.items():
                 loss_meter[k].update(v)
@@ -120,87 +116,38 @@ class MainRunner:
         if bid % display_n_batches != 0:
             print_log()
 
-    def eval(self, save=None):
+    def eval(self, data_loader=None):
         self.model.eval()
-        if save is not None:
-            save_dict = collections.defaultdict(list)
+        if data_loader is None:
+            data_loader = self.test_loader
         with torch.no_grad():
             metrics_logger = collections.defaultdict(lambda: AverageMeter())
 
             with torch.no_grad():
-                for bid, batch in enumerate(self.test_loader, 1):
+                for bid, batch in enumerate(data_loader, 1):
                     durations = np.asarray([i[1] for i in batch['raw']])
                     gt = np.asarray([i[2] for i in batch['raw']])
+                    bsz = len(durations)
 
                     net_input = move_to_cuda(batch['net_input'])
-                    # net_input['props'] = batch['net_input']['props'].expand(len(self.device_ids), -1, -1, -1)
-                    # net_input['props_valid'] = batch['net_input']['props_valid'].expand(len(self.device_ids), -1, -1)
-                    # forward
-                    # pdb.set_trace()
                     time_st = time.time()
                     output = self.model(**net_input)
-
-                    bsz = len(durations)
-                    
                     width = output['width'].view(bsz)
-                    # torch.clamp(width, max=0.5)
                     center = output['center'].view(bsz)
                     selected_props = torch.stack([torch.clamp(center-width/2, min=0), 
                                                   torch.clamp(center+width/2, max=1)], dim=-1)
                     time_en = time.time()
                     selected_props = selected_props.cpu().numpy()
-                    # if top_n > 1:
-                    #     num_clips = self.num_clips
-                    #     sort_idx = np.argsort(-prob, -1)
-                    #     cand_props = list(self.props[sort_idx])  # [bsz, cand_props, 2]
-                    #     top_n_selected_props = [selected_props]
-                    #
-                    #     for it in range(1, top_n):
-                    #         ptr_props = top_n_selected_props[-1]
-                    #         selected_props = []
-                    #         for i in range(bsz):
-                    #             p2 = cand_props[i]
-                    #             p1 = np.repeat(np.expand_dims(ptr_props[i], 0),
-                    #                            p2.shape[0], 0)
-                    #
-                    #             iou = calculate_IoU_batch2((p1[:, 0], p1[:, 1]), (p2[:, 0], p2[:, 1]))
-                    #             keep = iou <= thresh
-                    #             # print(keep.shape, cand_props[i].shape)
-                    #             cand_props[i] = cand_props[i][keep]
-                    #             # print(cand_props[i].shape)
-                    #             selected_props.append(cand_props[i][0])
-                    #         top_n_selected_props[-1] = top_n_selected_props[-1] * durations[:, np.newaxis] / num_clips
-                    #         # print(np.asarray(selected_props).shape, selected_props[0].shape)
-                    #         top_n_selected_props.append(np.asarray(selected_props))
-                    #     top_n_selected_props[-1] = top_n_selected_props[-1] * durations[:, np.newaxis] / num_clips
-                    #     res = top_n_metric(top_n_selected_props, gt)
-                    # else:
-                    # selected_props = selected_props * durations[:, np.newaxis, np.newaxis]
+                    
                     gt = gt / durations[:, np.newaxis]
                     res = top_1_metric(selected_props, gt)
                     for key, v in res.items():
-                        metrics_logger['R@1,'+key].update(v, bsz)
-
-                    if save is not None:
-                        # pdb.set_trace()
-                        for key in ['gauss_weight', 'attn_weight']:
-                            save_dict[key] += [d for d in output[key].cpu().numpy()]
-                        # pred_words_score, pred_words_id = output['words_logit'].max(dim=-1)
-                        # save_dict['pred_words_id'] += [d for d in pred_words_id.cpu().numpy()]
-                        # save_dict['pred_words_score'] += [d for d in pred_words_score.cpu().numpy()]
-                        save_dict['selected_props'] += [d for d in selected_props]
-                        # save_dict['ori_props'] += [d for d in ori_props]
-                        save_dict['gt'] += [d for d in gt]
+                        metrics_logger[key].update(v, bsz)
                     metrics_logger['Time'].update(time_en-time_st, bsz)
 
-            # for k, v in metrics_logger.items():
-                # print('| {} {:.4f}'.format(k, v.avg), end=' ')
-            # print('|')
             msg = '|'.join([' {} {:.4f} '.format(k, v.avg) for k, v in metrics_logger.items()])
             info('|'+msg+'|')
-            if save is not None:
-                Path(save).parent.mkdir(parents=True, exist_ok=True)
-                pickle.dump(save_dict, open(save, 'wb'))
+
             return metrics_logger
 
     def _build_dataset(self):
@@ -209,7 +156,7 @@ class MainRunner:
         from torch.utils.data import DataLoader
         args = self.args['dataset']
         cls = getattr(da, args['dataset'], None)
-        # vocab = KeyedVectors.load_word2vec_format(args['vocab_path'], binary=True)
+
         with open(args['vocab_path'], 'rb') as fp:
             vocab = pickle.load(fp)
         self.train_set = cls(data_path=args['train_data'], vocab=vocab, args=args, is_training=True)
@@ -244,37 +191,27 @@ class MainRunner:
 
     def _build_model(self):
         model_config = self.args['model']
-        # print(model_config)
         import models
 
-        device_ids = list(range(len(os.environ['CUDA_VISIBLE_DEVICES'].split(','))))
-        info('GPU: {}'.format(device_ids))
-        if model_config['name'] == 'Caption':
-            from models.cap_transformer import Caption
-            self.model = Caption(model_config['config'], Vocab(self.train_loader.dataset.keep_vocab))
-        else:
-            self.model = getattr(models, model_config['name'], None)(model_config['config'])
-        self.model = self.model.cuda(device_ids[0])
+        self.model = getattr(models, model_config['name'], None)(model_config['config'])
+        self.model = self.model.cuda()
         print(self.model)
-        # self.model = torch.nn.DataParallel(self.model, device_ids=device_ids)
-        self.device_ids = device_ids
 
     def _build_optimizer(self):
         from optimizers import AdamOptimizer
         from optimizers.lr_schedulers import InverseSquareRootSchedule
-        self.model.unfrozen()
-        parameters = list(filter(lambda p: p.requires_grad, self.model.parameters()))
-        # parameters = self.model.comp_parameters()
-        args = self.args['train']["pg"]
-        self.optimizer = AdamOptimizer(args, parameters)
-        self.lr_scheduler = InverseSquareRootSchedule(args, self.optimizer)
 
-        self.model.frozen()
+        self.model.froze_mask_generator()
         parameters = list(filter(lambda p: p.requires_grad, self.model.parameters()))
-        # parameters = self.model.gauss_parameters()
-        args = self.args['train']["gauss"]
-        self.gauss_optimizer = AdamOptimizer(args, parameters)
-        self.gauss_lr_scheduler = InverseSquareRootSchedule(args, self.gauss_optimizer)
+        args = self.args['train']["reconstructor"]
+        self.rec_optimizer = AdamOptimizer(args, parameters)
+        self.rec_lr_scheduler = InverseSquareRootSchedule(args, self.rec_optimizer)
+
+        self.model.froze_reconstructor()
+        parameters = list(filter(lambda p: p.requires_grad, self.model.parameters()))
+        args = self.args['train']["generator"]
+        self.mask_optimizer = AdamOptimizer(args, parameters)
+        self.mask_lr_scheduler = InverseSquareRootSchedule(args, self.mask_optimizer)
         
 
     def _save_model(self, path):
@@ -289,7 +226,8 @@ class MainRunner:
     def _load_model(self, path):
         state_dict = torch.load(path)
         self.num_updates = state_dict['num_updates']
-        self.lr_scheduler.step_update(self.num_updates)
+        self.mask_lr_scheduler.step_update(self.num_updates)
+        self.rec_lr_scheduler.step_update(self.num_updates)
         parameters = state_dict['model_parameters']
         self.model.load_state_dict(parameters)
         info('load model from {}, num_updates {}.'.format(path, self.num_updates))
@@ -305,7 +243,6 @@ def calculate_IoU_batch2(i0, i1):
     return iou
 
 
-# [nb, 2], [nb, 2]
 def top_n_metric(preds, label):
     result = {}
     bsz = preds[0].shape[0]
@@ -319,16 +256,6 @@ def top_n_metric(preds, label):
         result['IoU@0.{}'.format(i)] = 1.0 * np.sum(iou >= i / 10) / bsz
     return result
 
-
-def top_1_discount_metric(pred, label):
-    result = {}
-    bsz = pred.shape[0]
-    iou = calculate_IoU_batch2((pred[:, 0], pred[:, 1]), (label[:, 0], label[:, 1]))
-    discount = (1-np.abs(pred[:, 0]-label[:,0])) * (1-np.abs(pred[:, 1]-label[:, 1]))
-    result['mIoU'] = np.mean(iou)
-    for i in range(1, 10, 2):
-        result['IoU@0.{}'.format(i)] = 1.0 * np.sum((iou >= i / 10).astype(float) * discount) / bsz
-    return result
 
 def top_1_metric(pred, label):
     result = {}

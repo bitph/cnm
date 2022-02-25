@@ -1,5 +1,4 @@
 __pycache__
-checkpoints
 *.hdf5
-vocab.pkl
 logs
+scripts

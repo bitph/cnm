@@ -2,60 +2,52 @@
   "dataset": {
     "dataset": "ActivityNet",
     "feature_path": "data/activitynet/clip_vit_32_features.hdf5",
+    "vocab_path": "data/activitynet/glove.pkl",
     "vocab_size": 8000,
     "word_dim": 300,
     "frame_dim": 512,
     "max_num_words": 20,
     "max_num_frames": 200,
-    "target_stride": 1,
     "train_data": "data/activitynet/train_data.json",
     "test_data": "data/activitynet/test_data.json",
-    "val_data": "data/activitynet/val_data.json",
-    "vocab_path": "data/activitynet/glove.pkl",
-    "prop_width": [1]
+    "val_data": "data/activitynet/val_data.json"
   },
   "train": {
-    "gauss": {
+    "generator": {
       "lr": 4e-4,
       "weight_decay": 0,
       "warmup_updates": 400,
       "warmup_init_lr": 1e-7
     },
-    "pg": {
+    "reconstructor": {
       "lr": 4e-4,
       "weight_decay": 0,
       "warmup_updates": 400,
       "warmup_init_lr": 1e-7
     },
     "batch_size": 128,
-    "max_num_epochs": 50,
-    "model_saved_path": "checkpoints/activitynet/",
-    "num_proposals": 3,
-    "rewards": [0, 0.5, 1.0]
+    "max_num_epochs": 20,
+    "model_saved_path": "checkpoints/activitynet/"
   },
   "model": {
-    "name": "MainModel",
-    "twostep": true,
+    "name": "CNM",
     "config": {
-      "frames_input_size": 512,
-      "words_input_size": 300,
       "hidden_size": 256,
-      "neg": true,
-      "feat_pool_size": 1,
-      "num_props": 1,
-      "gauss_w": 5,
+      "use_negative": true,
+      "alpha": 5,
+      "max_width": 1,
+      "dropout": 0.1,
       "DualTransformer": {
         "d_model": 256,
         "num_heads": 4,
         "num_decoder_layers1": 3,
         "num_decoder_layers2": 3,
         "dropout": 0.1
-      },
-      "task": []
+      }
     }
   },
   "loss": {
-    "margin": 0.1,
-    "adv": false
+    "beta_1": 0.1,
+    "beta_2": 0.15
   }
 }

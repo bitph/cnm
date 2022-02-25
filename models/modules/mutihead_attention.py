@@ -190,12 +190,8 @@ class MultiheadAttention(nn.Module):
             # gauss_weight = gauss_weight.unsqueeze(1).repeat(self.num_heads, tgt_len, 1)
             gauss_weight = gauss_weight.unsqueeze(1).unsqueeze(1)\
                 .expand(-1, self.num_heads, tgt_len, -1).reshape(*attn_weights.shape)
-            tmp = attn_weights
             attn_weights = attn_weights * (gauss_weight + 1e-10)
             attn_weights = attn_weights / attn_weights.sum(dim=-1, keepdim=True)
-            if torch.isnan(attn_weights).any():
-                import pdb
-                pdb.set_trace()
         
         attn_weights = F.dropout(attn_weights, p=self.dropout, training=self.training)
 
